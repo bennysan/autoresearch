@@ -35,7 +35,8 @@ EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
 # Configuration
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
+DEFAULT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
+CACHE_DIR = os.environ.get("AUTORESEARCH_CACHE_DIR", DEFAULT_CACHE_DIR)
 DATA_DIR = os.path.join(CACHE_DIR, "data")
 TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
 BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
@@ -273,7 +274,15 @@ def _document_batches(split, tokenizer_batch_size=128):
         epoch += 1
 
 
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def _default_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def make_dataloader(tokenizer, B, T, split, buffer_size=1000, device=None):
     """
     BOS-aligned dataloader with best-fit packing.
     Every row starts with BOS. Documents packed using best-fit to minimize cropping.
@@ -293,14 +302,25 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
         token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
         doc_buffer.extend(token_lists)
 
+    if device is None:
+        device = _default_device()
+
     # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
     row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
+    use_cuda_staging = device.type == "cuda"
+    if use_cuda_staging:
+        cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
+        dev_buffer = torch.empty(2 * B * T, dtype=torch.long, device=device)
+        cpu_inputs = cpu_buffer[:B * T].view(B, T)
+        cpu_targets = cpu_buffer[B * T:].view(B, T)
+        inputs = dev_buffer[:B * T].view(B, T)
+        targets = dev_buffer[B * T:].view(B, T)
+    else:
+        cpu_buffer = None
+        cpu_inputs = None
+        cpu_targets = None
+        inputs = torch.empty((B, T), dtype=torch.long, device=device)
+        targets = torch.empty((B, T), dtype=torch.long, device=device)
 
     while True:
         for row_idx in range(B):
@@ -331,9 +351,13 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
                     row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
                     pos += remaining
 
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
+        if use_cuda_staging:
+            cpu_inputs.copy_(row_buffer[:, :-1])
+            cpu_targets.copy_(row_buffer[:, 1:])
+            dev_buffer.copy_(cpu_buffer, non_blocking=True)
+        else:
+            inputs.copy_(row_buffer[:, :-1].to(device=device, non_blocking=False))
+            targets.copy_(row_buffer[:, 1:].to(device=device, non_blocking=False))
         yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
@@ -341,7 +365,7 @@ def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def evaluate_bpb(model, tokenizer, batch_size, device=None):
     """
     Bits per byte (BPB): vocab size-independent evaluation metric.
     Sums per-token cross-entropy (in nats), sums target byte lengths,
@@ -349,9 +373,12 @@ def evaluate_bpb(model, tokenizer, batch_size):
     are excluded from both sums.
     Uses fixed MAX_SEQ_LEN so results are comparable across configs.
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
+    if device is None:
+        device = next(model.parameters()).device
+    token_bytes = get_token_bytes(device=device)
+    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val", device=device)
+    eval_tokens = int(os.environ.get("AUTORESEARCH_EVAL_TOKENS", EVAL_TOKENS))
+    steps = eval_tokens // (batch_size * MAX_SEQ_LEN)
     total_nats = 0.0
     total_bytes = 0
     for _ in range(steps):
